@@ -8,7 +8,8 @@
     "accept": "bun scripts/accept-flow.ts",
     "relay:register": "tsx scripts/register-agents.ts",
     "agents": "tsx src/agents/index.ts",
-    "demo:intake": "tsx scripts/demo-intake.ts"
+    "demo:intake": "tsx scripts/demo-intake.ts",
+    "dev:server": "tsx src/dev-server.ts"
   },
   "dependencies": {
     "@agent-relay/sdk": "15.0.1",

@@ -21,10 +21,13 @@ export async function startReviewer(name: "building" | "zoning"): Promise<void> 
     if (e.type === "REVIEW_REQUEST" && e.sender === "clerk") {
       // Revision 1 gets every rule; later revisions only the rules whose fields changed between frozen copies.
       const due = state.revision === 1 ? [...mine] : affectedRules(changedFields(state)).filter((r) => mine.includes(r))
+      // Findings land in the actor first. Each Relay post takes seconds, so post them together, then report completion.
       const findings = await runRules(e.permitId, due)
-      for (const f of findings) {
-        await me.send({ permitId: e.permitId, revision: f.revision, type: "FINDING", findingId: f.findingId, payload: f }, await explain(f))
-      }
+      await Promise.all(
+        findings.map(async (f) =>
+          me.send({ permitId: e.permitId, revision: f.revision, type: "FINDING", findingId: f.findingId, payload: f }, await explain(f)),
+        ),
+      )
       await me.send(
         { permitId: e.permitId, revision: state.revision, type: "REVIEW_COMPLETE", payload: { findingIds: findings.map((f) => f.findingId) } },
         findings.length

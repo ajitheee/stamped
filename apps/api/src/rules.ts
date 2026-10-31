@@ -1,7 +1,7 @@
 // stamped — deterministic rules. No LLM in here. The model only explains these results.
 // Rules read the Clerk's frozen copy of the deck, never the live draft. null means not provided, never a default.
 // Citations came from the applicant side's research. Check them against the sources before they appear on stage.
-import type { Deck, Finding, Property } from "./contracts"
+import type { Deck, Finding, PermitApplication, Property } from "./contracts"
 
 const SRC = {
   sjDecks: {
@@ -214,6 +214,22 @@ export const FIELD_TO_RULES: Record<string, RuleId[]> = {
   "property.zoning": ["SJ-ZONING-01"],
   "property.zoningBase": ["SJ-ZONING-01"],
   "property.zoningOverlay": ["SJ-ZONING-01"],
+}
+
+/** Deck fields that differ between the current frozen revision and the one before it. Read from the record, not a message. */
+export function changedFields(state: Pick<PermitApplication, "revision" | "revisions">): string[] {
+  const current = state.revisions.find((r) => r.revision === state.revision)
+  const previous = state.revisions.find((r) => r.revision === state.revision - 1)
+  if (!current || !previous) return []
+  return (Object.keys(current.deck) as (keyof Deck)[])
+    .filter((k) => current.deck[k] !== previous.deck[k])
+    .map((k) => `deck.${k}`)
+}
+
+/** Rules touched by a set of changed fields, in checklist order. */
+export function affectedRules(fields: string[]): RuleId[] {
+  const hit = new Set(fields.flatMap((field) => FIELD_TO_RULES[field] ?? []))
+  return ALL_RULES.filter((ruleId) => hit.has(ruleId))
 }
 
 /* Expected on the demo deck (16 × 12 ft, 36 in, attached, guard 36 in, no ledger, no setback, R-1-8):

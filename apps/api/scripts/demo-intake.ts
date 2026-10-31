@@ -1,5 +1,6 @@
 // Step 3 acceptance: plays the applicant side over Agent Relay to drive the office agents end to end.
-// Needs the actor service and the agents running (npm run agents). Then: npm run demo:intake
+// Needs the actor service and the agents running (npm run agents). Then: npm run demo:intake [permit-id]
+// Open /office/<permit-id> first to watch it live; DEMO_PAUSE_MS=4000 pauses between rounds for an audience.
 import "../src/agents/env"
 
 import { actors } from "../generated/index.js"
@@ -29,8 +30,9 @@ function check(ok: boolean, label: string) {
   if (!ok) process.exitCode = 1
 }
 
-const id = `relay-${Date.now()}`
+const id = process.argv[2] ?? `relay-${Date.now()}`
 const permit = actors.Permit.get(id)
+const pause = () => new Promise((r) => setTimeout(r, Number(process.env.DEMO_PAUSE_MS ?? 0)))
 
 async function waitFor(label: string, done: (s: State) => boolean, ms = 90_000): Promise<State> {
   const end = Date.now() + ms
@@ -69,12 +71,14 @@ check(
   `revision 1 findings: ${Object.entries(statuses).map(([r, s]) => `${r} ${s}`).join(", ")}`,
 )
 
+await pause()
 const rev2 = await permit.submitRevision({ deck: { guardHeightIn: 42 }, changedFields: ["deck.guardHeightIn"] })
 await intake.send({ permitId: id, revision: rev2, type: "REVISION_SUBMITTED", payload: { changedFields: ["deck.guardHeightIn"] } }, "Homeowner raised the guard to 42 in.")
 const r2 = await waitFor("revision 2 decision", sentBack(2))
 const rerun2 = r2.findings.filter((f) => f.revision === 2)
 check(rerun2.length === 1 && rerun2[0]?.ruleId === "CRC-GUARD-01" && rerun2[0].status === "PASS", `revision 2 reran: ${rerun2.map((f) => `${f.ruleId} ${f.status}`).join(", ")}`)
 
+await pause()
 const rev3 = await permit.submitRevision({ deck: { ledgerType: "1/2 in through-bolts" }, changedFields: ["deck.ledgerType"] })
 await intake.send({ permitId: id, revision: rev3, type: "REVISION_SUBMITTED", payload: { changedFields: ["deck.ledgerType"] } }, "Homeowner described the ledger: 1/2 in through-bolts.")
 const r3 = await waitFor("PRE_REVIEW_COMPLETE", (s) => s.status === "PRE_REVIEW_COMPLETE")
