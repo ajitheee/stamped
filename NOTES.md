@@ -1,5 +1,27 @@
 # NOTES
 
+## Demo on the Mac (both halves on one machine)
+
+Needs Bun 1.4.2+ and Node 22+. Get the `.env` values by DM, never through the repo.
+
+1. Run `git pull`.
+2. Actor service, in `services/actors`:
+   ```
+   cp .env.example .env    # then set DURABLE_ACTORS_SECRET
+   bun install && bun run dev
+   ```
+   Wait for "Connect your application" and "Authentication is enabled". It listens on 7111. If you use another port, change `DURABLE_ACTORS_CONTROL_PLANE_URL` in `apps/api/.env` to match.
+3. API, in `apps/api` (second terminal):
+   ```
+   cp .env.example .env    # then fill in every value
+   bun install && bun run generate && bun run accept    # expect 20 PASS
+   ```
+4. **Only one set of office agents may run against the Relay workspace.** Make sure the Codespace agents are stopped (they are as of 14:20), then run `npm run agents` in `apps/api`.
+5. Web: start the shared web app and open `/office/<permit-id>`. Until the shared `/api/permits/:id/socket` route exists, `npm run dev:server` in `apps/api` serves it, then run `bun install && bun run dev` in `apps/web`.
+6. Rehearse without the real Intake: `DEMO_PAUSE_MS=5000 npm run demo:intake rehearsal-1` in `apps/api` while `/office/rehearsal-1` is open.
+
+**Backup:** the Codespace still runs the actor service, dev API and web server, with agents stopped. To switch, stop the agents on the Mac, start them in the Codespace, and use a new permit id, because permits don't move between machines. Old test channels in Relay belong to permits on the Codespace. Agents on the Mac will log harmless "Intake is not confirmed" errors for them at startup.
+
 ## PermitActor API (`services/actors/src/Permit.ts`)
 
 One actor per permit, addressed by the permit id. Each contract key is its own `@Persisted @Emittable` field with the same name, so a socket gets `{ type: "state", state }` on connect and `{ type: "state_update", changes }` after every change.
