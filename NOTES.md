@@ -22,7 +22,7 @@ One actor per permit, addressed by the permit id. Each contract key is its own `
 - READY_FOR_REVIEW needs a confirmed intake and freezes revision 1. REVISED freezes the submitted revision. Rules read these frozen copies.
 - PRE_REVIEW_COMPLETE needs findings for the current revision and no open CORRECTION or NEEDS_INFORMATION (`blocksStamp`).
 - Socket metadata is `{ role: "applicant" | "clerk" | "building" | "zoning" | "viewer" }`. **`POST /api/permits/:id/socket` must mint only `"applicant"` or `"viewer"`.** Only the Clerk's backend mints `"clerk"`.
-- **Not signed yet:** dev runs with "Authentication is disabled" until `DURABLE_ACTORS_SECRET` is set on both sides.
+- **Signed:** `DURABLE_ACTORS_SECRET` is set in `services/actors/.env` (the dev server prints "Authentication is enabled") and in `apps/api/.env`. Any backend that calls the actor, including the applicant side's, needs the same value. Without it, reads and socket grants are refused (HTTP 401). This was tested on 2026-10-31.
 
 ## Rules (`apps/api/src/rules.ts`)
 
