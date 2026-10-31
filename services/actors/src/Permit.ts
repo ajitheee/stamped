@@ -1,123 +1,160 @@
-// stamped — PermitActor. One instance per permit id; the single durable record agents write decisions to.
+// stamped — PermitActor. One instance per permit id (the actor id); the single durable record agents write decisions to.
 // Relay is for talking. This is for remembering. Screens read only this.
-import { Actor, type ActorSocket, Persisted } from "durable-actors"
+import { Actor, type ActorSocket, Emittable, Persisted } from "durable-actors"
 
 import {
   ALLOWED_TRANSITIONS,
+  ChatMessage,
   Deck,
   Finding,
-  PermitApplication,
   Property,
-  Status,
-  type Event,
+  RelayLogEntry,
+  blocksStamp,
+  currentFindings,
+  emptyPermit,
+  missingMinimum,
+  type FrozenRevision,
+  type Intake,
+  type PermitApplication,
+  type PermitEvent,
+  type PermitStatus,
 } from "../../../apps/api/src/contracts.js"
 
-type Who = Event["actor"]
-type FieldPatch = Partial<Deck> & { property?: Partial<PermitApplication["property"]> }
+// Signed into the socket grant by the backend. Only the Clerk's grant may carry role "clerk".
+export type Role = "applicant" | "clerk" | "building" | "zoning" | "viewer"
+type Metadata = { role: Role }
+type Incoming = { type: "setStatus"; to: PermitStatus; why: string; requestId: string }
+type Outgoing =
+  | { type: "ack"; requestId: string; status: PermitStatus }
+  | { type: "denied"; requestId: string; reason: string }
+type Socket = ActorSocket<Metadata, Outgoing>
 
-// Named apart from the FieldPatch type: sharing the name pulls Zod's types into the actor's public surface,
-// which the Durable Actors declaration compiler cannot emit.
-const FieldPatchSchema = Deck.partial().extend({ property: Property.partial().optional() }).strict()
+const EMPTY = emptyPermit("")
+const DeckPatch = Deck.partial().strict()
+const now = () => new Date().toISOString()
 
-// Fields can only change while nobody is reviewing them.
-const EDITABLE: Status[] = ["INTAKE", "READY_FOR_REVIEW", "CORRECTIONS_REQUESTED"]
+export class Permit extends Actor<Metadata, Incoming, Outgoing> {
+  // One field per contract key, same names, so the socket's state frame already has the contract's shape.
+  // @Persisted saves on assignment only: always reassign, never push or mutate in place.
+  @Persisted @Emittable status: PermitStatus = EMPTY.status
+  @Persisted @Emittable revision: number = EMPTY.revision
+  @Persisted @Emittable property: Property | null = EMPTY.property
+  @Persisted @Emittable deck: Deck = EMPTY.deck
+  @Persisted @Emittable intake: Intake = EMPTY.intake
+  @Persisted @Emittable chat: ChatMessage[] = EMPTY.chat
+  @Persisted @Emittable revisions: FrozenRevision[] = EMPTY.revisions
+  @Persisted @Emittable findings: Finding[] = EMPTY.findings
+  @Persisted @Emittable events: PermitEvent[] = EMPTY.events
+  @Persisted @Emittable relayLog: RelayLogEntry[] = EMPTY.relayLog
+  // Relay delivers at least once. Keys already logged or handled live here so dedupe survives restarts.
+  @Persisted private seen: string[] = []
 
-const event = (actor: Who, type: string, detail: string): Event => ({
-  at: new Date().toISOString(),
-  actor,
-  type,
-  detail,
-})
+  // ---------- Applicant side ----------
 
-export class Permit extends Actor<null, null, PermitApplication> {
-  @Persisted private state: PermitApplication | null = null
-
-  /** Sets state if empty; otherwise returns the existing record unchanged. */
-  async init(app: PermitApplication): Promise<PermitApplication> {
-    if (this.state) return this.state
-    const parsed = PermitApplication.parse(app)
-    if (parsed.id !== this.id) throw new Error(`Application id ${parsed.id} does not match permit ${this.id}`)
-    return this.#commit({
-      ...parsed,
-      events: [...parsed.events, event("system", "CREATED", `Permit opened at ${parsed.status}`)],
-    })
+  async read(): Promise<Omit<PermitApplication, "id">> {
+    const { status, revision, property, deck, intake, chat, revisions, findings, events, relayLog } = this
+    return { status, revision, property, deck, intake, chat, revisions, findings, events, relayLog }
   }
 
-  async get(): Promise<PermitApplication | null> {
-    return this.state
+  async appendChat(message: ChatMessage): Promise<void> {
+    this.chat = [...this.chat, ChatMessage.parse(message)]
   }
 
-  async confirmFields(patch: FieldPatch, actor: Who): Promise<PermitApplication> {
-    const s = this.#require()
-    if (!EDITABLE.includes(s.status)) throw new Error(`Fields are locked while status is ${s.status}`)
-    const { property, ...deck } = FieldPatchSchema.parse(patch)
-    const confirmed = [
-      ...Object.entries(deck).map(([k, v]) => event(actor, "FIELD_CONFIRMED", `deck.${k} = ${v}`)),
-      ...Object.entries(property ?? {}).map(([k, v]) => event(actor, "FIELD_CONFIRMED", `property.${k} = ${v}`)),
-    ]
-    if (confirmed.length === 0) return s
-    return this.#commit({
-      ...s,
-      deck: { ...s.deck, ...deck },
-      property: { ...s.property, ...property },
-      events: [...s.events, ...confirmed],
-    })
+  async setProperty(property: Property): Promise<void> {
+    this.#assertDraftOpen()
+    this.property = Property.parse(property)
   }
 
-  /** The Clerk is the only status writer. Everyone else is rejected, as is any transition not in the contract. */
-  async setStatus(to: Status, by: Who, why: string): Promise<PermitApplication> {
-    const s = this.#require()
-    const next = Status.parse(to)
-    if (by !== "clerk") throw new Error(`Only the clerk can change status; ${by} tried ${s.status} → ${next}`)
-    if (!ALLOWED_TRANSITIONS[s.status].includes(next)) throw new Error(`Cannot move from ${s.status} to ${next}`)
-    return this.#commit({
-      ...s,
-      status: next,
-      events: [...s.events, { ...event("clerk", "STATUS_CHANGED", why), from: s.status, to: next }],
-    })
+  async applyIntakePatch(input: { deck: Partial<Deck>; missingFields: string[]; unknownFields: string[] }): Promise<void> {
+    this.#assertDraftOpen()
+    this.deck = { ...this.deck, ...DeckPatch.parse(input.deck) }
+    this.intake = { ...this.intake, missingFields: input.missingFields, unknownFields: input.unknownFields }
   }
 
-  /** Reruns for the same rule and revision replace the earlier finding in place. */
-  async addFinding(f: Finding): Promise<PermitApplication> {
-    const s = this.#require()
+  /** Locks the draft. Idempotent. */
+  async confirmIntake(at: string): Promise<void> {
+    if (this.intake.complete) return
+    this.#assertDraftOpen()
+    const missing = missingMinimum(this)
+    if (missing.length) throw new Error(`Cannot confirm yet; missing ${missing.join(", ")}`)
+    this.intake = { ...this.intake, complete: true, confirmedAt: at }
+    this.#event("intake", "Homeowner confirmed the application", null, null)
+  }
+
+  /** Opens the next revision. One submit per round: the Clerk must freeze it before another is accepted. */
+  async submitRevision(input: { deck: Partial<Deck>; changedFields: string[] }): Promise<number> {
+    if (this.status !== "CORRECTIONS_REQUESTED") throw new Error(`Revisions open only at CORRECTIONS_REQUESTED, not ${this.status}`)
+    if (this.revisions.at(-1)?.revision !== this.revision) throw new Error(`Revision ${this.revision} is already submitted`)
+    this.deck = { ...this.deck, ...DeckPatch.parse(input.deck) }
+    this.revision = this.revision + 1
+    this.#event("intake", `Revision ${this.revision} submitted: ${input.changedFields.join(", ")}`, null, null)
+    return this.revision
+  }
+
+  // ---------- Office side ----------
+
+  /** Building and Zoning record findings for the revision under review. A rerun of a rule replaces it in place. */
+  async addFinding(f: Finding): Promise<void> {
     const finding = Finding.parse(f)
-    if (finding.revision !== s.revision) {
-      throw new Error(`Finding ${finding.findingId} is for revision ${finding.revision}; permit is at ${s.revision}`)
+    if (this.status !== "IN_REVIEW") throw new Error(`Findings are recorded only IN_REVIEW, not ${this.status}`)
+    if (finding.revision !== this.revision) {
+      throw new Error(`Finding ${finding.findingId} is for revision ${finding.revision}; permit is at ${this.revision}`)
     }
-    const i = s.findings.findIndex((x) => x.ruleId === finding.ruleId && x.revision === finding.revision)
-    return this.#commit({
-      ...s,
-      findings: i === -1 ? [...s.findings, finding] : s.findings.map((x, j) => (j === i ? finding : x)),
-      events: [...s.events, event(finding.reviewer, "FINDING_ADDED", `${finding.ruleId}: ${finding.status}`)],
-    })
+    const i = this.findings.findIndex((x) => x.ruleId === finding.ruleId && x.revision === finding.revision)
+    this.findings = i === -1 ? [...this.findings, finding] : this.findings.map((x, j) => (j === i ? finding : x))
   }
 
-  /** Old findings stay; they carry their own revision number. */
-  async bumpRevision(by: Who): Promise<PermitApplication> {
-    const s = this.#require()
-    if (by !== "clerk") throw new Error(`Only the clerk can open a new revision; ${by} tried`)
-    const revision = s.revision + 1
-    return this.#commit({
-      ...s,
-      revision,
-      events: [...s.events, event("clerk", "REVISION_BUMPED", `Revision ${revision} opened`)],
-    })
+  /** One human sentence per Relay message, logged once per relayKey however often it is delivered. */
+  async logRelay(key: string, entry: RelayLogEntry): Promise<boolean> {
+    if (!this.#firstTime(`log:${key}`)) return false
+    this.relayLog = [...this.relayLog, RelayLogEntry.parse(entry)]
+    return true
   }
 
-  async onConnect(socket: ActorSocket<null, PermitApplication>): Promise<void> {
-    if (this.state) socket.send(this.state)
+  /** A receiver claims a Relay message before acting on it. True only the first time for that receiver. */
+  async claim(receiver: RelayLogEntry["sender"], key: string): Promise<boolean> {
+    return this.#firstTime(`${receiver}:${key}`)
+  }
+
+  /** Status has no RPC. It moves only here, over a socket whose signed metadata says role "clerk". */
+  async onMessage(socket: Socket, message: Incoming): Promise<void> {
+    const deny = (reason: string) => socket.send({ type: "denied", requestId: message.requestId, reason })
+    if (socket.metadata.role !== "clerk") {
+      return deny(`Only the clerk changes status; ${socket.metadata.role} tried ${this.status} → ${message.to}`)
+    }
+    if (!ALLOWED_TRANSITIONS[this.status]?.includes(message.to)) return deny(`Cannot move from ${this.status} to ${message.to}`)
+    if (message.to === "READY_FOR_REVIEW" && !this.intake.complete) return deny("Intake is not confirmed")
+    if (message.to === "PRE_REVIEW_COMPLETE") {
+      if (!this.findings.some((f) => f.revision === this.revision)) return deny(`Revision ${this.revision} has not been reviewed`)
+      const open = currentFindings(this.findings).filter(blocksStamp)
+      if (open.length) return deny(`Open items block the stamp: ${open.map((f) => f.ruleId).join(", ")}`)
+    }
+    const from = this.status
+    // Each freeze is the copy the rules read: revision 1 at READY_FOR_REVIEW, later ones at REVISED.
+    if (message.to === "READY_FOR_REVIEW" || message.to === "REVISED") this.#freeze()
+    this.status = message.to
+    this.#event("clerk", message.why, from, message.to)
+    socket.send({ type: "ack", requestId: message.requestId, status: this.status })
   }
 
   // Helpers use #private: the runtime treats every prototype method as a callable actor method and requires it async.
-  // @Persisted saves on assignment, so every change builds a new object and assigns it once.
-  #commit(next: PermitApplication): PermitApplication {
-    this.state = next
-    this.broadcast(next)
-    return next
+
+  #assertDraftOpen(): void {
+    if (this.status !== "INTAKE" || this.intake.complete) throw new Error("The application is confirmed and locked")
   }
 
-  #require(): PermitApplication {
-    if (!this.state) throw new Error(`Permit ${this.id} has not been created`)
-    return this.state
+  #freeze(): void {
+    const frozen: FrozenRevision = { revision: this.revision, deck: this.deck, frozenAt: now() }
+    this.revisions = [...this.revisions.filter((r) => r.revision !== this.revision), frozen]
+  }
+
+  #event(who: string, why: string, from: PermitStatus | null, to: PermitStatus | null): void {
+    this.events = [...this.events, { at: now(), who, why, from, to }]
+  }
+
+  #firstTime(key: string): boolean {
+    if (this.seen.includes(key)) return false
+    this.seen = [...this.seen, key]
+    return true
   }
 }

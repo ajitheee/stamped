@@ -1,40 +1,72 @@
-# NOTES — where the docs differ from CLAUDE.md
+# NOTES
 
-## Durable Actors (v0.14.6, read 2026-10-31)
+## PermitActor API (`services/actors/src/Permit.ts`)
 
-- **Runs on macOS/Linux only.** Needs Bun 1.4.2+, and the runtime ships no Windows build. On Windows, run the actor service in a GitHub Codespace (or WSL).
-- **Entrypoint is `services/actors/src/actors.ts`**, loaded by `durable-actors dev`. `Permit` lives in `src/Permit.ts` and is re-exported there.
-- **`broadcast(value)` JSON-encodes for you.** We broadcast the state object, not `JSON.stringify(state)` (that would double-encode). A new socket gets the current state from `onConnect`.
-- **`@Persisted` saves on assignment only.** `this.state.events.push(...)` is not saved. Every Permit method builds a new state and assigns it once.
-- **Clients don't open a fixed socket URL.** The backend calls `actors.Permit.prepareWebsocket({ actorId, metadata: null })` and gets a short-lived `websocketUrl` grant, which must be opened before `connectByMs`. So `GET /api/permits/:id/events` should hand out a grant, or proxy the socket.
-- **Generated client:** run `bun run generate` with the dev server up. It writes `services/actors/generated/` (gitignored, as in their examples). Regenerate after changing actor methods. `actors.Permit.get(id).method()` works as CLAUDE.md assumed.
-- **Reentrancy:** calls are serialized by default. `@Interleave` opts a method out and disables rollback for the whole class. Permit does not use it.
+One actor per permit, addressed by the permit id. Each contract key is its own `@Persisted @Emittable` field with the same name, so a socket gets `{ type: "state", state }` on connect and `{ type: "state_update", changes }` after every change.
 
-### Found while running it (not in the docs)
+**Applicant side (RPC)**
+- `read()` returns the whole record minus `id`.
+- `appendChat(message)`
+- `setProperty(property)` and `applyIntakePatch({ deck, missingFields, unknownFields })` throw once the draft is confirmed.
+- `confirmIntake(at)` locks the draft. It is idempotent and throws while `missingMinimum()` is not empty.
+- `submitRevision({ deck, changedFields })` works only at CORRECTIONS_REQUESTED and returns the new revision. One submit per round: a second one before the Clerk freezes it is refused.
 
-- **Every prototype method is an actor method and must be `async`.** TypeScript `private` doesn't hide a helper; the build fails with "actor method Permit.commit must be async". Use `#private` methods for sync helpers.
-- **Don't give a Zod schema and a type the same name in an actor file.** If a public method uses that type, the declaration compiler also pulls in the schema's Zod type and fails with "Cannot resolve public type dependency strip". The patch schema is `FieldPatchSchema` for this reason.
-- **Use Zod 3 in both `apps/api` and `services/actors`.** `durable-actors` itself depends on Zod 4. Without its own `zod@^3` dependency, `services/actors` resolves `zod` to that Zod 4 copy, and the generated client's types (copied from `contracts.ts`, written for Zod 3) silently become `any`. `generate` still prints "Type dependencies: zod@4.6.7"; ignore it.
-- **Use Bun, not npm**, in both folders (`bun install`). The lockfiles are `bun.lock`.
+**Office side (RPC)**
+- `addFinding(finding)` works only IN_REVIEW and only for the current revision. A rerun of the same rule and revision replaces it.
+- `logRelay(relayKey, entry)` appends one `relayLog` line per key and returns `false` for a redelivered message.
+- `claim(receiver, relayKey)` returns `true` only the first time that receiver sees the message. Call it before acting on any Relay message.
+
+**Status (socket only, no RPC)**
+- Send `{ type: "setStatus", to, why, requestId }`. The reply is `{ type: "ack", requestId, status }` or `{ type: "denied", requestId, reason }`.
+- It is accepted only if the socket's grant has `metadata.role === "clerk"` and `ALLOWED_TRANSITIONS` allows the move. `apps/api/src/clerk-socket.ts` wraps this.
+- READY_FOR_REVIEW needs a confirmed intake and freezes revision 1. REVISED freezes the submitted revision. Rules read these frozen copies.
+- PRE_REVIEW_COMPLETE needs findings for the current revision and no open CORRECTION or NEEDS_INFORMATION (`blocksStamp`).
+- Socket metadata is `{ role: "applicant" | "clerk" | "building" | "zoning" | "viewer" }`. **`POST /api/permits/:id/socket` must mint only `"applicant"` or `"viewer"`.** Only the Clerk's backend mints `"clerk"`.
+- **Not signed yet:** dev runs with "Authentication is disabled" until `DURABLE_ACTORS_SECRET` is set on both sides.
+
+## Rules (`apps/api/src/rules.ts`)
+
+- Rules read the frozen deck. `null` means not provided.
+- Every finding has `citation` and `evidence`.
+- **SJ-PERMIT-01** has five triggers: area ≥ 200 sq ft, ≥ 30 in at any point, attached, serves an exit door, serves as a door landing. Any one trigger means a permit is required, even if other answers are unknown.
+- **CRC-GUARD-01** cites 2025 CRC R321.1.1 and R321.1.2. A guard is required above 30 in; deck guards must be at least 42 in. Its constant is separate from the permit trigger's.
+- **SJ-DETAIL-01** checks only that a ledger connection is described.
+- **SJ-ZONING-01** is always NEEDS_HUMAN_VERIFICATION, including when the zoning district wasn't retrieved, because a homeowner can't supply a district and NEEDS_INFORMATION would block the stamp forever. It flags any overlay.
+- **Citations are not verified by the office side.** The San Jose site blocked an automated fetch. Check them against the city pages before the demo.
+
+## API (`apps/api`)
+
+- **Actor client:** generated into `apps/api/generated/` (gitignored) from the running actor service: `cp .env.example .env`, `bun install`, `bun run generate`. Rerun `generate` after the actor's methods change.
+- **`review.ts`:**
+  - `runRules(id, ruleIds)` runs rules on the current frozen revision.
+  - `changedFields(state)` compares frozen revisions, so it doesn't trust the message.
+  - `affectedRules(fields)`.
+  - `decide(state)` returns the Clerk's call.
+- **`moduleResolution: bundler`**, because `rules.ts` imports `./contracts` without an extension. Under Node, run the agents with `tsx`.
+- **Acceptance:** `bun run accept` covers intake, the Clerk-only status, the four demo findings, a refused early stamp, two revisions that each rerun only the affected rule, the stamp, Relay de-duplication, and a viewer socket seeing every status live. That's 20 checks. Then restart the actor service and run `bun run accept -- --after-restart` (2 checks). All passed on 2026-10-31.
+
+## Durable Actors (v0.14.6)
+
+- **macOS/Linux only:** it needs Bun 1.4.2+ and ships no Windows build. Office code is tested in a GitHub Codespace. The demo runs on the applicant side's Mac (dev binds to loopback).
+- **Entrypoint:** `services/actors/src/actors.ts` re-exports `Permit`.
+- **Saving:** `@Persisted` saves on assignment only. Reassign arrays and objects; never push or mutate in place.
+- **Async methods:** every prototype method is a callable actor method and must be `async`, so TypeScript `private` doesn't hide one. Sync helpers work as `#private` methods.
+- **Zod schema names:** don't give a Zod schema and a type the same name in an actor file. The declaration compiler then fails with "Cannot resolve public type dependency strip".
+- **Zod 3 in both folders:** `durable-actors` brings Zod 4. Without its own `zod@^3`, `services/actors` picks up Zod 4, and the generated client's types silently become `any`. `generate` still prints "Type dependencies: zod@4.6.7"; ignore it.
+- **Bun, not npm:** use Bun in both folders. The lockfiles are `bun.lock`.
 
 ## Running the actor service (Codespace)
 
 ```
-export PATH=$HOME/.bun/bin:$PATH        # Bun is installed in the Codespace
-cd /workspaces/stamped/services/actors
-cp .env.example .env                    # once
-bun install && bun run dev              # wait for "Connect your application"
-bun run generate                        # second terminal, after changing actor methods
-bun run accept                          # Step 1 acceptance; restart dev, then: bun run accept -- --after-restart
+export PATH=$HOME/.bun/bin:$PATH
+cd /workspaces/stamped/services/actors && cp .env.example .env && bun install && bun run dev
+cd /workspaces/stamped/apps/api && cp .env.example .env && bun install && bun run generate && bun run accept
 ```
 
-Step 1 acceptance passed on 2026-10-31: building rejected, clerk accepted, a skipped transition rejected, both sockets got the broadcast, and the status and event survived a restart.
+## Agent Relay (from the applicant side; office side has not used it yet)
 
-## Small additions to the Step 1 spec
-
-- `setStatus` and `bumpRevision` accept any actor in `by`, not only `"clerk"`, so the rejection of non-clerk callers can be shown at runtime.
-- `init` appends a `CREATED` event and `bumpRevision` appends `REVISION_BUMPED`, so the audit timeline has a first line and shows revisions.
-
-## Agent Relay
-
-- Not read yet (Step 3).
+- Pin `@agent-relay/sdk@15.0.1`. It is confirmed as the latest on npm and needs Node 22+. The docs page shows v7.
+- Pass `workspaceKey` and `baseUrl` in code. `arws_` keys use `https://armadillo.agentrelay.com/`; `rklive_` keys use the default.
+- Register intake, clerk, building and zoning once, share the tokens, and reconnect on boot.
+- Post at the channel's top level. Delivery is at least once, so de-duplicate with `claim` and `logRelay`, never in memory.
+- Run agents under Node.

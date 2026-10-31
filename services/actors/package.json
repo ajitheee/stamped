@@ -5,8 +5,7 @@
   "scripts": {
     "dev": "durable-actors dev",
     "generate": "durable-actors generate",
-    "check": "tsc --noEmit",
-    "accept": "bun scripts/accept.ts"
+    "check": "tsc --noEmit"
   },
   "dependencies": {
     "durable-actors": "^0.14.6",
