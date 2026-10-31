@@ -235,5 +235,7 @@ export const RelayEnvelope = z.object({
 export type RelayEnvelope = z.infer<typeof RelayEnvelope>
 
 export const permitChannel = (permitId: string) => `permit-${permitId}`
-export const relayKey = (e: Pick<RelayEnvelope, "permitId" | "revision" | "type" | "findingId">) =>
-  `${e.permitId}:${e.revision}:${e.type}:${e.findingId ?? "-"}`
+// Office side: sender is part of the key. Building and Zoning both send REVIEW_COMPLETE for the same revision,
+// and without it the second one is dropped as a duplicate.
+export const relayKey = (e: Pick<RelayEnvelope, "permitId" | "revision" | "sender" | "type" | "findingId">) =>
+  `${e.permitId}:${e.revision}:${e.sender}:${e.type}:${e.findingId ?? "-"}`

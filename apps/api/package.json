@@ -5,14 +5,19 @@
   "scripts": {
     "generate": "durable-actors generate",
     "check": "tsc --noEmit",
-    "accept": "bun scripts/accept-flow.ts"
+    "accept": "bun scripts/accept-flow.ts",
+    "relay:register": "tsx scripts/register-agents.ts",
+    "agents": "tsx src/agents/index.ts",
+    "demo:intake": "tsx scripts/demo-intake.ts"
   },
   "dependencies": {
+    "@agent-relay/sdk": "15.0.1",
     "zod": "^3.25.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "durable-actors": "^0.14.6",
+    "tsx": "^4.19.0",
     "typescript": "~5.9.3"
   }
 }

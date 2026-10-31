@@ -137,7 +137,7 @@ check(decide(await permit.read()) === "PRE_REVIEW_COMPLETE", "only the planner i
 await clerk.setStatus("PRE_REVIEW_COMPLETE", "Pre-review complete; rear setback goes to a City planner")
 
 // Relay delivers at least once: the actor logs and handles each relayKey once.
-const key = relayKey({ permitId: id, revision: 3, type: "REVIEW_COMPLETE" })
+const key = relayKey({ permitId: id, revision: 3, sender: "zoning", type: "REVIEW_COMPLETE" })
 const entry = { at: new Date().toISOString(), sender: "zoning", type: "REVIEW_COMPLETE", revision: 3, text: "Zoning finished revision 3." } as const
 check((await permit.logRelay(key, entry)) && !(await permit.logRelay(key, entry)), "a redelivered message is logged once")
 check((await permit.claim("clerk", key)) && !(await permit.claim("clerk", key)), "a redelivered message is handled once")
